@@ -1,6 +1,7 @@
 import numpy as np 
 import scipy.stats as stats
 
+
 class Gibbs_Sampler(object):
     def __init__(self, data, n_components,tau, n_iter, burn_in, init_G, init_norm_G):
         self.n_components = n_components
@@ -31,7 +32,6 @@ class Gibbs_Sampler(object):
         count = 0
         while accept==False:
             count+=1
-            #print(inv_pdfval)
             cutoff= np.log(np.random.uniform(size=1))
 
             self.hold_G = stats.matrix_normal.rvs(self.G, np.linalg.inv(xTx), np.linalg.inv(self.norm_G_interim[0:self.n_components,0:self.n_components]))
