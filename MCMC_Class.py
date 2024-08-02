@@ -60,7 +60,7 @@ class Gibbs_Sampler(object):
             if cutoff <  upper:
                 accept = True
         self.G = mean_G[:,0:self.n_components]
-    def _sample_parameters(self):
+    def sample_parameters(self):
         for iter in range(self.n_iter+self.burn_in):
             self.norm_G_Update()
             self.G_Update()
