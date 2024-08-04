@@ -8,7 +8,7 @@ class Gibbs_Sampler(object):
         self.G_storage = np.repeat(np.expand_dims(init_G[:,0:self.n_components],2),n_iter,axis=2)
         self.norm_G_storage = np.repeat(np.expand_dims(init_norm_G[0:self.n_components,0:self.n_components],2),n_iter,axis=2)
         self.data = data
-        self.G_interim= init_G
+        self.G_interim = init_G
         self.G = init_G[:,0:self.n_components]
         self.norm_G_interim = init_norm_G
         self.norm_G = init_norm_G[0:self.n_components,0:self.n_components]
