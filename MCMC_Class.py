@@ -70,7 +70,7 @@ class Gibbs_Sampler(object):
                 self.norm_G_storage[:,:,iter-self.burn_in] = self.norm_G
                 self.G_storage[:,:,iter-self.burn_in] = self.G# -*- coding: utf-8 -*-
 
-cfrom math import isinf
+from math import isinf
 import numpy as np
 
 def DictParts(m, n):
