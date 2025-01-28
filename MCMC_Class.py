@@ -1,5 +1,6 @@
 import numpy as np 
 import scipy.stats as stats
+import scipy.linalg as la
 
 
 class Gibbs_Sampler(object):
@@ -9,8 +10,8 @@ class Gibbs_Sampler(object):
         self.norm_G_storage = np.repeat(np.expand_dims(init_norm_G[0:self.n_components,0:self.n_components],2),n_iter,axis=2)
         self.data = data
         self.G_interim = init_G
-        self.G = init_G[:,0:self.n_components]
-        self.norm_G_interim = init_norm_G
+        self.G = init_G[:,0:self.n_components].astype(np.complex128)
+        self.norm_G_interim = init_norm_G.astype(np.complex128)
         self.norm_G = init_norm_G[0:self.n_components,0:self.n_components]
         self.n = data.shape[1]
         self.n_iter = n_iter
@@ -31,11 +32,10 @@ class Gibbs_Sampler(object):
         accept= False
         count = 0
         while accept==False:
-            count+=1
-            cutoff= np.log(np.random.uniform(size=1))
+            count += 1
+            cutoff = np.log(np.random.uniform(size=1))
 
-            self.hold_G = stats.matrix_normal.rvs(self.G, np.linalg.inv(xTx), np.linalg.inv(self.norm_G_interim[0:self.n_components,0:self.n_components]))
-            mean_G = self.hold_G
+            mean_G = np.real(self.hold_G)
             for i in range(1, self.n_components):
                 projection =np.dot(mean_G[:,i],np.squeeze(mean_G[:,0:i]))
                 norm = np.array(np.dot(np.squeeze(mean_G[:,0:i].T),np.squeeze(mean_G[:,0:i])))         
@@ -53,13 +53,16 @@ class Gibbs_Sampler(object):
                     mean_G[:,i] = mean_G[:,i] - np.sum(np.matmul(test1,projectionnorm),1)
                 elif i==1:
                     mean_G[:,i] = np.squeeze(mean_G[:,i]) - np.squeeze(test1)*projectionnorm
-            norm = np.diag(np.array(np.dot(np.squeeze(mean_G[:,:].T),np.squeeze(mean_G[:,:]))))
-            for i in range(self.n_components):
-                mean_G[:,i] = mean_G[:,i]/np.linalg.norm(mean_G[:,i])
-            upper=(np.matrix.trace(np.matmul(np.matmul(np.matmul(xTx,mean_G),self.norm_G[0:self.n_components,0:self.n_components]),mean_G.T))-np.matrix.trace(np.matmul(np.matmul(np.matmul(xTx,self.G,),self.norm_G[0:self.n_components,0:self.n_components]),self.G.T)))
-            if cutoff <  upper:
-                accept = True
-        self.G = mean_G[:,0:self.n_components]
+                norm = np.diag(np.array(np.dot(np.squeeze(mean_G[:,:].T),np.squeeze(mean_G[:,:]))))
+                for i in range(self.n_components):
+                    mean_G[:,i] = mean_G[:,i]/np.linalg.norm(mean_G[:,i])
+                upper = np.matrix.trace(-self.tau*np.matmul(np.matmul(np.matmul(xTx,mean_G),self.norm_G[0:self.n_components,0:self.n_components]),mean_G.T))-np.matrix.trace(-self.tau*np.matmul(np.matmul(np.matmul(xTx,self.G,),self.norm_G[0:self.n_components,0:self.n_components]),self.G.T))
+                #print(cutoff)
+                #print(upper)
+                if cutoff <  upper:
+                    
+                    accept = True
+                    self.G = mean_G[:,0:self.n_components]
     def sample_parameters(self):
         for iter in range(self.n_iter+self.burn_in):
             self.norm_G_Update()
@@ -68,4 +71,4 @@ class Gibbs_Sampler(object):
                 print(iter)
             if iter >= self.burn_in:
                 self.norm_G_storage[:,:,iter-self.burn_in] = self.norm_G
-                self.G_storage[:,:,iter-self.burn_in] = self.G# -*- coding: utf-8 -*-
+                self.G_storage[:,:,iter-self.burn_in] = self.G
