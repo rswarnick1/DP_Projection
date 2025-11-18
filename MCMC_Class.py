@@ -75,7 +75,6 @@ class DPPM_MCMC:
         self.step_size_G = step_size_G
 
         self.rng = np.random.default_rng(random_state)
-
         # Optional geomstats sphere for vMF updates
         self._sphere = None
         if self.G_update == "vmf_geomstats":
@@ -230,11 +229,27 @@ class DPPM_MCMC:
             self.c[i] = self.rng.choice(K, p=probs)
 
     def _update_pi(self):
-        """Gibbs update for mixture weights pi (Dirichlet)."""
-        alpha_k = self.alpha / self.K
-        counts = np.bincount(self.c, minlength=self.K)
-        self.pi = self.rng.dirichlet(alpha_k + counts)
+        """
+        Update mixture weights pi | c using Dirichlet conjugacy.
 
+        Prior: pi ~ Dir(alpha/K, ..., alpha/K)
+        Posterior: pi | c ~ Dir(alpha/K + n_1, ..., alpha/K + n_K)
+        """
+        # self.alpha is a scalar concentration parameter
+        alpha = float(self.alpha)
+
+        # base concentration per component
+        alpha_k = alpha / float(self.K)
+
+        # counts of each cluster (ensure 1-D float array of length K)
+        counts = np.bincount(np.asarray(self.c, dtype=int), minlength=self.K).astype(float)
+
+        # Dirichlet parameter vector (shape (K,))
+        alpha_vec = alpha_k + counts
+
+        # sample new mixture weights
+        # works whether self.rng is np.random.Generator or RandomState
+        self.pi = self.rng.dirichlet(alpha_vec)
     def _update_tau2(self):
         """Gibbs update for tau2_k (Inverse-Gamma)."""
         a0, b0 = self.a_tau, self.b_tau
@@ -389,6 +404,47 @@ class DPPM_MCMC:
         self._update_sigma2()
         self._update_G()
 
+    def _canonicalize_labels(self):
+        """
+        Enforce a deterministic ordering and sign convention on the components.
+
+        Assumes:
+        self.G      : shape (p, K)
+        self.tau2   : shape (K,)
+        self.pi     : shape (K,)
+        self.c      : shape (n,) cluster labels in {0,...,K-1}
+        self.z      : shape (n,) latent projections
+        """
+        K = self.G.shape[1]
+
+        # 1) Order components by decreasing tau^2
+        order = np.argsort(self.tau2)[::-1]   # largest tau^2 first
+
+        # reorder parameters
+        self.G    = self.G[:, order]
+        self.tau2 = self.tau2[order]
+        self.pi   = self.pi[order]
+
+        # relabel cluster assignments accordingly
+        # old label -> new label map
+        inv_map = np.zeros(K, dtype=int)
+        inv_map[order] = np.arange(K)
+        self.c = inv_map[self.c]
+    def _canonicalize_signs(self):
+        """
+        Make each direction g_k have a deterministic sign:
+        ensure the entry with largest absolute value is positive.
+        """
+        p, K = self.G.shape
+        for k in range(K):
+            gk = self.G[:, k]
+            j = np.argmax(np.abs(gk))  # index of largest-magnitude coordinate
+            if gk[j] < 0:
+                # flip sign of direction
+                self.G[:, k] = -gk
+                # and flip latent z_i for all points in this cluster
+                mask = (self.c == k)
+                self.z[mask] = -self.z[mask]
     def run(self, n_iter=1000, burn_in=500, thin=1, store_everything=True):
         """
         Run MCMC and collect samples.
@@ -421,8 +477,10 @@ class DPPM_MCMC:
         kept_sigma2 = []
         kept_c = []
         kept_z = []
-
+    
         for it in range(n_iter):
+            if it%20==0:
+                print("Iteration ",it)
             self.step()
 
             if it >= burn_in and ((it - burn_in) % thin == 0):
@@ -443,7 +501,8 @@ class DPPM_MCMC:
         if store_everything:
             samples["c"] = np.stack(kept_c, axis=0)
             samples["z"] = np.stack(kept_z, axis=0)
-
+        self._canonicalize_labels()
+        self._canonicalize_signs()
         return samples
     
         # ------------------------------------------------------------------
@@ -495,3 +554,398 @@ class DPPM_MCMC:
 
         return S, mu, kappa
 
+class EigenGP_DPPM_MCMC(DPPM_MCMC):
+    """
+    DPPM variant where each direction g_k(t) is represented as a Gaussian process
+    in an eigenfunction basis Phi with diagonal eigenvalues.
+
+    Model:
+        X_i(t) = Z_i g_{C_i}(t) + epsilon_i(t),
+        g_k(t) = sum_{j=1}^J b_{jk} phi_j(t),  b_{·k} ~ N(0, diag(eigenvalues)).
+
+    In matrix form, if Phi is (m x J) (grid x basis), and B is (J x K),
+    then G = Phi @ B is (m x K) and plays the same role as in DPPM_MCMC.
+    """
+
+    def __init__(
+        self,
+        X,
+        Phi,
+        eigenvalues,
+        K,
+        alpha=1.0,
+        a_tau=.0001,
+        b_tau=.0001,
+        a_sigma=.0001,
+        b_sigma=.001,
+        sampler_type="uncollapsed",
+        random_state=None,
+    ):
+        """
+        Parameters
+        ----------
+        X : array, shape (n, m)
+            Observed functional data evaluated on a common grid of size m.
+        Phi : array, shape (m, J)
+            Basis matrix of eigenfunctions evaluated on the grid.
+        eigenvalues : array, shape (J,)
+            Eigenvalues of the GP covariance associated with the basis Phi.
+        K : int
+            Max number of mixture components (finite truncation).
+        Other arguments are as in DPPM_MCMC.
+        """
+        self.Phi = np.asarray(Phi)
+        self.eigenvalues = np.asarray(eigenvalues)
+        if self.Phi.ndim != 2:
+            raise ValueError("Phi must be a 2D array (m x J).")
+        if self.eigenvalues.ndim != 1:
+            raise ValueError("eigenvalues must be a 1D array.")
+        if self.Phi.shape[1] != self.eigenvalues.shape[0]:
+            raise ValueError("Phi.shape[1] must match len(eigenvalues).")
+
+        # Precompute Phi^T Phi (J x J) for the Gaussian regression
+        self.S_Phi = self.Phi.T @ self.Phi  # (J x J)
+
+        # Call parent constructor to set up z, c, tau2, sigma2, etc.
+        # We ignore the G_update argument here because we override _update_G.
+        super().__init__(
+            X=X,
+            K=K,
+            alpha=alpha,
+            a_tau=a_tau,
+            b_tau=b_tau,
+            a_sigma=a_sigma,
+            b_sigma=b_sigma,
+            sampler_type=sampler_type,
+            G_update="vmf_geomstats",
+            random_state=random_state,
+        )
+
+        # Replace the direct G initialization with an eigenfunction-based one.
+        J = self.Phi.shape[1]
+        # B has prior N(0, diag(eigenvalues)) on each column
+        # We sample from that prior here as an initialization.
+        std = np.sqrt(self.eigenvalues)
+        self.B = self.rng.normal(size=(J, K)) * std[:, None]
+
+        # Build G from B and orthonormalize columns
+        self._update_G_from_B()
+
+    # ------------------------------------------------------------------
+    # Internal helpers for eigenfunction-GP representation
+    # ------------------------------------------------------------------
+    def _update_G_from_B(self):
+        """
+        Construct G = Phi @ B and orthonormalize its columns so that
+        it can be used with the existing likelihood code.
+        """
+        G = self.Phi @ self.B  # shape: (m, K)
+        # Orthonormalize columns via QR
+        Q, _ = np.linalg.qr(G)
+        self.G = Q[:, : self.K]
+
+    # We override the generic G update to use a GP/B update instead.
+    def _update_G(self):
+        self._update_B_gp()
+        self._update_G_from_B()
+
+    def _update_B_gp(self):
+        """
+        Gibbs update for the eigenfunction coefficients B.
+
+        For each component k, we solve a Gaussian linear regression problem:
+            X_i ≈ z_i Phi b_k + noise,  b_k ~ N(0, diag(eigenvalues)).
+        """
+        X = self.X                      # (n x m)
+        Phi = self.Phi                 # (m x J)
+        S_Phi = self.S_Phi             # (J x J)
+        eigenvalues = self.eigenvalues # (J,)
+        Lambda_inv = 1.0 / eigenvalues
+
+        sigma2 = self.sigma2
+        n, m = X.shape
+        J = Phi.shape[1]
+
+        for k in range(self.K):
+            idx = np.where(self.c == k)[0]
+            if idx.size == 0:
+                # No data assigned to this component: draw from prior
+                eta = self.rng.normal(size=J)
+                self.B[:, k] = np.sqrt(eigenvalues) * eta
+                continue
+
+            z_k = self.z[idx]  # latent projections for this component
+
+            # Sufficient statistics for Gaussian regression:
+            #   sum_i z_i^2   and   sum_i z_i Phi^T X_i
+            sum_z2 = float(np.dot(z_k, z_k))
+
+            # S = sum_i z_i * Phi^T X_i  (J-dimensional)
+            S = np.zeros(J)
+            for i in idx:
+                S += self.z[i] * (Phi.T @ X[i])
+
+            # Posterior precision: Lambda^{-1} + (sum z_i^2 / sigma2) * Phi^T Phi
+            Precision = np.diag(Lambda_inv) + (sum_z2 / sigma2) * S_Phi  # (J x J)
+
+            # Cholesky factor of the precision matrix
+            L = np.linalg.cholesky(Precision)
+
+            # mean = Precision^{-1} (S / sigma2) via two triangular solves
+            rhs = S / sigma2
+            y = np.linalg.solve(L, rhs)
+            mean = np.linalg.solve(L.T, y)
+
+            # Sample from N(mean, Precision^{-1}) using the same Cholesky
+            eta = self.rng.normal(size=J)
+            delta = np.linalg.solve(L.T, eta)
+            self.B[:, k] = mean + delta
+
+
+    def _canonicalize_labels(self):
+        """
+        Enforce a deterministic ordering and sign convention on the components.
+
+        Assumes:
+        self.G      : shape (p, K)
+        self.tau2   : shape (K,)
+        self.pi     : shape (K,)
+        self.c      : shape (n,) cluster labels in {0,...,K-1}
+        self.z      : shape (n,) latent projections
+        """
+        K = self.G.shape[1]
+
+        # 1) Order components by decreasing tau^2
+        order = np.argsort(self.tau2)[::-1]   # largest tau^2 first
+
+        # reorder parameters
+        self.G    = self.G[:, order]
+        self.tau2 = self.tau2[order]
+        self.pi   = self.pi[order]
+
+        # relabel cluster assignments accordingly
+        # old label -> new label map
+        inv_map = np.zeros(K, dtype=int)
+        inv_map[order] = np.arange(K)
+        self.c = inv_map[self.c]
+
+    def _canonicalize_labels(self):
+        """
+        Enforce a deterministic ordering and sign convention on the components.
+
+        Assumes:
+        self.G      : shape (p, K)
+        self.tau2   : shape (K,)
+        self.pi     : shape (K,)
+        self.c      : shape (n,) cluster labels in {0,...,K-1}
+        self.z      : shape (n,) latent projections
+        """
+        K = self.G.shape[1]
+
+        # 1) Order components by decreasing tau^2
+        order = np.argsort(self.tau2)[::-1]   # largest tau^2 first
+
+        # reorder parameters
+        self.G    = self.G[:, order]
+        self.tau2 = self.tau2[order]
+        self.pi   = self.pi[order]
+
+        # relabel cluster assignments accordingly
+        # old label -> new label map
+        inv_map = np.zeros(K, dtype=int)
+        inv_map[order] = np.arange(K)
+        self.c = inv_map[self.c]
+    def _canonicalize_signs(self):
+        """
+        Make each direction g_k have a deterministic sign:
+        ensure the entry with largest absolute value is positive.
+        """
+        p, K = self.G.shape
+        for k in range(K):
+            gk = self.G[:, k]
+            j = np.argmax(np.abs(gk))  # index of largest-magnitude coordinate
+            if gk[j] < 0:
+                # flip sign of direction
+                self.G[:, k] = -gk
+                # and flip latent z_i for all points in this cluster
+                mask = (self.c == k)
+                self.z[mask] = -self.z[mask]
+
+class DPPMRegressionMCMC:
+    """
+    Convenience wrapper that uses DPPM_MCMC as a prior model on
+    multi-task linear regression coefficients.
+
+    We assume a setting with:
+        Y: (n_samples, n_tasks)
+        X: (n_samples, p_features)
+
+    For each task t, we fit an initial OLS estimate of the coefficient
+    vector beta_t, stack them into a matrix B_ols of shape (p, n_tasks),
+    and run a Euclidean DPPM on the rows of B_ols^T (each task is one
+    "observation" in p dimensions).
+
+    This is a two-stage / empirical-Bayes style construction that treats
+    the OLS estimates as noisy observations from the underlying DPPM
+    prior on beta_t. It is useful pedagogically to illustrate how the
+    Euclidean DPPM can act as a prior over regression coefficients.
+
+    Parameters
+    ----------
+    X : array, shape (n, p)
+        Design matrix shared across tasks.
+    Y : array, shape (n, T)
+        Matrix of responses for T tasks.
+    K : int
+        Truncation level / maximum number of projection axes.
+    alpha, a_tau, b_tau, a_sigma, b_sigma, sampler_type, G_update,
+    step_size_G, random_state :
+        Passed through to the underlying DPPM_MCMC instance.
+
+    Attributes
+    ----------
+    B_ols : array, shape (p, T)
+        OLS estimates of the regression coefficients for each task.
+    dppm : DPPM_MCMC
+        Internal DPPM sampler run on B_ols.T (shape (T, p)).
+    """
+
+    def __init__(
+        self,
+        X,
+        Y,
+        K,
+        alpha=1.0,
+        a_tau=.0001,
+        b_tau=.0001,
+        a_sigma=.0001,
+        b_sigma=.001,
+        sampler_type="collapsed",
+        G_update="vmf_geomstats",
+        step_size_G=0.05,
+        random_state=None,
+    ):
+        self.X = np.asarray(X)
+        self.Y = np.asarray(Y)
+        if self.X.ndim != 2:
+            raise ValueError("X must be 2D (n_samples, p_features).")
+        if self.Y.ndim != 2:
+            raise ValueError("Y must be 2D (n_samples, n_tasks).")
+        n, p = self.X.shape
+        n_y, T = self.Y.shape
+        if n_y != n:
+            raise ValueError("X and Y must have the same number of rows (samples).")
+
+        self.n = n
+        self.p = p
+        self.T = T
+        self.K = int(K)
+
+        # Compute task-wise OLS estimates beta_t via least squares:
+        #   beta_t = argmin ||Y[:, t] - X beta||_2^2
+        B_ols = np.zeros((p, T))
+        for t in range(T):
+            # lstsq returns (coef, residuals, rank, singular_values)
+            coef, *_ = np.linalg.lstsq(self.X, self.Y[:, t], rcond=None)
+            B_ols[:, t] = coef
+        self.B_ols = B_ols
+
+        # Instantiate an internal DPPM on the OLS coefficient vectors.
+        # Each "observation" is one task's coefficient vector of length p.
+        X_for_dppm = B_ols.T  # shape (T, p)
+        self.dppm = DPPM_MCMC(
+            X=X_for_dppm,
+            K=self.K,
+            alpha=alpha,
+            a_tau=a_tau,
+            b_tau=b_tau,
+            a_sigma=a_sigma,
+            b_sigma=b_sigma,
+            sampler_type=sampler_type,
+            G_update=G_update,
+            step_size_G=step_size_G,
+            random_state=random_state,
+        )
+
+    def run(self, n_iter=1000, burn_in=500, thin=1, store_everything=True,G_update="vmf_geomstats"):
+        """
+        Run the internal DPPM_MCMC sampler and construct posterior draws
+        for the regression coefficients beta_t implied by the projection model.
+
+        Returns
+        -------
+        results : dict
+            Dictionary with keys:
+                - 'dppm_samples': raw samples dictionary returned by DPPM_MCMC.run
+                - 'beta_samples': array of shape (n_kept, p, T)
+                      posterior draws beta_t^{(s)} = z_t^{(s)} g_{c_t^{(s)}}.
+                - 'beta_mean': array of shape (p, T)
+                      posterior mean of beta_t over kept samples.
+        """
+        samples = self.dppm.run(
+            n_iter=n_iter,
+            burn_in=burn_in,
+            thin=thin,
+            store_everything=store_everything
+        )
+
+        G_samps = samples["G"]          # (n_kept, p, K)
+        if "z" not in samples or "c" not in samples:
+            raise ValueError(
+                "store_everything must be True in DPPMRegressionMCMC.run "
+                "to reconstruct beta samples (need 'z' and 'c')."
+            )
+        z_samps = samples["z"]          # (n_kept, T)
+        c_samps = samples["c"]          # (n_kept, T)
+
+        n_kept = G_samps.shape[0]
+        p = self.p
+        T = self.T
+        K = self.K
+
+        beta_samps = np.zeros((n_kept, p, T))
+        for s in range(n_kept):
+            G = G_samps[s]   # (p, K)
+            z = z_samps[s]   # (T,)
+            c = c_samps[s]   # (T,)
+            for t in range(T):
+                k = int(c[t])
+                beta_samps[s, :, t] = z[t] * G[:, k]
+
+        beta_mean = beta_samps.mean(axis=0)
+
+        return {
+            "dppm_samples": samples,
+            "beta_samples": beta_samps,
+            "beta_mean": beta_mean,
+        }
+
+    def predict(self, X_new, beta_mean=None):
+        """
+        Compute predictions for each task using a matrix of coefficients.
+
+        Parameters
+        ----------
+        X_new : array, shape (n_new, p)
+            New design matrix.
+        beta_mean : array, shape (p, T), optional
+            Coefficient matrix to use for prediction. If None, uses the
+            last computed posterior mean from run().
+
+        Returns
+        -------
+        Y_pred : array, shape (n_new, T)
+        """
+        X_new = np.asarray(X_new)
+        if X_new.ndim != 2:
+            raise ValueError("X_new must be 2D (n_new, p).")
+        if X_new.shape[1] != self.p:
+            raise ValueError("X_new has wrong number of columns.")
+
+        if beta_mean is None:
+            raise ValueError(
+                "beta_mean is None. Call run() first and pass the returned "
+                "beta_mean, or store it on the instance."
+            )
+
+        return X_new @ beta_mean
